@@ -18,10 +18,13 @@ from .alignment import (
     align_beats,
     validate_anchors,
 )
+from .comp_plan import CompPlanError, build_comp_plan
 from .database import get_db, init_db
 from .ensemble import EnsembleError, build_consensus
 from .review import ReviewError, extract_review_segments
 from .schemas import (
+    CompPlanOut,
+    CompPlanRequest,
     ConsensusRequest,
     EnsembleConsensusOut,
     JobCreate,
@@ -41,7 +44,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="多轨录音节拍对齐 API",
-    version="1.4.0",
+    version="1.5.0",
     description=(
         "提交参考节拍网格与演奏轨音符起始时间，服务使用带宽约束的动态时间规整"
         "（Sakoe-Chiba DTW）处理漏拍、抢拍与插入拍，回溯生成一一对应映射及"
@@ -53,6 +56,10 @@ app = FastAPI(
         "先以各轨匹配拍偏差中位数估计并校正固定录音延迟，再按参考拍汇总，"
         "至少 3 轨匹配的拍取校正时间中位数为合奏基准并列出超阈值异常任务，"
         "覆盖不足的拍标记为不可判定且不报异常。"
+        "调用 /takes/comp-plan 可对至少 2 条共享参考网格的已对齐录音按小节做"
+        "动态规划拼轨：以完整匹配小节各拍的平均绝对偏差为选用代价、相邻小节"
+        "换轨另付非负代价，总代价最小时优先请求顺序靠前的任务，返回合并连续"
+        "同源小节的剪辑片段。"
     ),
     lifespan=lifespan,
 )
@@ -380,3 +387,86 @@ def ensemble_consensus(
             detail=str(exc),
         )
     return consensus
+
+
+@app.post(
+    "/takes/comp-plan",
+    response_model=CompPlanOut,
+    status_code=status.HTTP_200_OK,
+    tags=["takes"],
+)
+def takes_comp_plan(
+    payload: CompPlanRequest,
+    db: sqlite3.Connection = Depends(get_db),
+):
+    """多轨按小节拼轨的剪辑方案（按需计算、只读，不落库）。
+
+    提交**至少 2 个已完成**任务 ID（每任务一条已对齐录音）、每小节拍数与
+    非负换轨代价。按参考拍把共享网格划分为小节，只有**完整匹配该小节全部拍**
+    的录音可选，选用代价为该小节匹配拍的**平均绝对偏差**；动态规划最小化
+    「各小节选用代价 + 相邻小节换轨代价」之和，同代价时优先请求顺序靠前的
+    任务。返回合并连续同源小节后的片段（任务 ID、参考拍索引范围、来源首末
+    匹配音时间）。
+
+    - 重复 ID：400；任务不存在：404；任务未对齐（`pending`）/无对齐结果：409；
+      上次对齐失败（`error`）：400；参考节拍网格不完全相同：422；
+      任务数不足 2、每小节拍数非法或换轨代价为负：422；
+      某小节没有任何录音完整匹配其全部拍：422（明细含小节序号）。
+    """
+    if len(set(payload.job_ids)) != len(payload.job_ids):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="任务 ID 不可重复",
+        )
+
+    jobs = []
+    for job_id in payload.job_ids:
+        job = crud.get_job(db, job_id)
+        if job is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"任务 {job_id} 不存在",
+            )
+        if job["status"] == "pending":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"任务 {job_id} 尚未对齐",
+            )
+        if job["status"] == "error":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"任务 {job_id} 上次对齐失败：{job['error']}",
+            )
+        if job["result"] is None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"任务 {job_id} 尚无对齐结果，"
+                    "请先调用 /jobs/{id}/align 执行对齐"
+                ),
+            )
+        jobs.append(job)
+
+    reference_beats = jobs[0]["reference_beats"]
+    for job in jobs[1:]:
+        if job["reference_beats"] != reference_beats:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=(
+                    f"任务 {jobs[0]['id']} 与任务 {job['id']} 的参考节拍网格"
+                    "不完全相同，剪辑方案仅接受完全一致的参考节拍网格"
+                ),
+            )
+
+    try:
+        plan = build_comp_plan(
+            jobs,
+            beats_per_bar=payload.beats_per_bar,
+            switch_cost=payload.switch_cost,
+        )
+    except CompPlanError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        )
+    return plan

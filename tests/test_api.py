@@ -874,6 +874,261 @@ class TestAPI(unittest.TestCase):
         })
         self.assertEqual(r.status_code, 422)
 
+    # ---- 多轨剪辑方案 POST /takes/comp-plan ----
+
+    COMP_REF = [0.5 * i for i in range(6)]  # 6 拍
+
+    def _create_comp_take(self, deviations):
+        """创建并对齐一条剪辑轨：deviations 给出每个参考拍的偏差（秒）。
+
+        全部拍一一匹配（perftime 严格递增要求偏差差不越过 0.5s 拍间隔）。
+        """
+        perf = [round(0.5 * i + d, 6) for i, d in enumerate(deviations)]
+        return self._create_done_job({
+            "reference_beats": self.COMP_REF,
+            "performance_onsets": perf,
+            "params": {"band_width": 2},
+            "anchors": [
+                {"ref_index": 0, "perf_index": 0},
+                {"ref_index": 5, "perf_index": 5},
+            ],
+        })
+
+    def _create_comp_take_with_miss(self, miss_index, deviations):
+        """创建并对齐一条含漏拍的剪辑轨。"""
+        perf = [
+            round(0.5 * i + d, 6)
+            for i, d in enumerate(deviations) if i != miss_index
+        ]
+        return self._create_done_job({
+            "reference_beats": self.COMP_REF,
+            "performance_onsets": perf,
+            "params": {"band_width": 2},
+            "anchors": [
+                {"ref_index": 0, "perf_index": 0},
+                {"ref_index": 5, "perf_index": 4},
+            ],
+        })
+
+    def test_comp_plan_selects_and_merges(self):
+        # 小节0（拍0-2）：轨1 更准（0.01）；小节1（拍3-5）：轨2 更准（0.01）
+        id1 = self._create_comp_take([0.01] * 3 + [0.04] * 3)
+        id2 = self._create_comp_take([0.03] * 3 + [0.01] * 3)
+        r = self.client.post("/takes/comp-plan", json={
+            "job_ids": [id1, id2],
+            "beats_per_bar": 3,
+            "switch_cost": 0.0,
+        })
+        self.assertEqual(r.status_code, 200, r.text)
+        data = r.json()
+        self.assertEqual(data["job_ids"], [id1, id2])
+        self.assertEqual(data["bar_count"], 2)
+        self.assertEqual(data["beats_per_bar"], 3)
+        self.assertEqual(data["take_count"], 2)
+        self.assertEqual(data["reference_beat_count"], 6)
+        self.assertEqual(data["switch_count"], 1)
+        self.assertAlmostEqual(data["total_cost"], 0.02, places=6)
+        self.assertEqual(data["segment_count"], 2)
+        first, second = data["segments"]
+        self.assertEqual(first["job_id"], id1)
+        self.assertEqual(second["job_id"], id2)
+        self.assertEqual(first["bar_start"], 1)
+        self.assertEqual(first["bar_end"], 1)
+        self.assertEqual(second["bar_start"], 2)
+        self.assertEqual(second["bar_end"], 2)
+        # 参考拍索引范围 / 拍号
+        self.assertEqual(first["ref_start_index"], 0)
+        self.assertEqual(first["ref_end_index"], 2)
+        self.assertEqual(first["beat_number_start"], 1)
+        self.assertEqual(first["beat_number_end"], 3)
+        # 来源首末匹配音时间
+        self.assertAlmostEqual(first["source_start_time"], 0.01, places=6)
+        self.assertAlmostEqual(first["source_end_time"], 1.01, places=6)
+        self.assertAlmostEqual(second["source_start_time"], 1.51, places=6)
+        self.assertAlmostEqual(second["source_end_time"], 2.51, places=6)
+        self.assertEqual(first["source_start_perf_index"], 0)
+        self.assertEqual(first["source_end_perf_index"], 2)
+        self.assertEqual(second["source_start_perf_index"], 3)
+        self.assertEqual(second["source_end_perf_index"], 5)
+
+    def test_comp_plan_consecutive_same_source_merged(self):
+        # 3 小节（每小节 2 拍）：轨1 占首节、轨2 占后两节且同源 -> 合并
+        id1 = self._create_comp_take([0.01, 0.01, 0.09, 0.09, 0.03, 0.03])
+        id2 = self._create_comp_take([0.08, 0.08, 0.02, 0.02, 0.02, 0.02])
+        r = self.client.post("/takes/comp-plan", json={
+            "job_ids": [id1, id2],
+            "beats_per_bar": 2,
+            "switch_cost": 0.0,
+        })
+        self.assertEqual(r.status_code, 200, r.text)
+        data = r.json()
+        self.assertEqual(data["bar_count"], 3)
+        self.assertEqual([s["job_id"] for s in data["segments"]], [id1, id2])
+        merged = data["segments"][1]
+        self.assertEqual(merged["bar_start"], 2)
+        self.assertEqual(merged["bar_end"], 3)
+        self.assertEqual(merged["bar_count"], 2)
+        self.assertEqual(merged["ref_start_index"], 2)
+        self.assertEqual(merged["ref_end_index"], 5)
+        self.assertEqual(merged["beat_number_start"], 3)
+        self.assertEqual(merged["beat_number_end"], 6)
+        self.assertAlmostEqual(
+            merged["source_start_time"], 1.02, places=6
+        )
+        self.assertAlmostEqual(
+            merged["source_end_time"], 2.52, places=6
+        )
+
+    def test_comp_plan_switch_cost_changes_plan(self):
+        id1 = self._create_comp_take([0.01] * 3 + [0.04] * 3)
+        id2 = self._create_comp_take([0.03] * 3 + [0.01] * 3)
+        # 换轨 1->2 = 0.01+0.01+0.05 = 0.07 > 全程轨2 的 0.04 -> 全程轨2
+        r = self.client.post("/takes/comp-plan", json={
+            "job_ids": [id1, id2],
+            "beats_per_bar": 3,
+            "switch_cost": 0.05,
+        })
+        self.assertEqual(r.status_code, 200, r.text)
+        data = r.json()
+        self.assertEqual(data["segment_count"], 1)
+        self.assertEqual(data["segments"][0]["job_id"], id2)
+        self.assertEqual(data["switch_count"], 0)
+        self.assertAlmostEqual(data["total_cost"], 0.04, places=6)
+
+    def test_comp_plan_tie_prefers_request_order(self):
+        id1 = self._create_comp_take([0.01] * 6)
+        id2 = self._create_comp_take([0.01] * 6)
+        r = self.client.post("/takes/comp-plan", json={
+            "job_ids": [id1, id2],
+            "beats_per_bar": 3,
+            "switch_cost": 0.02,
+        })
+        self.assertEqual(r.status_code, 200, r.text)
+        data = r.json()
+        self.assertEqual([s["job_id"] for s in data["segments"]], [id1])
+
+        # 调换请求顺序 -> 优先另一条
+        r = self.client.post("/takes/comp-plan", json={
+            "job_ids": [id2, id1],
+            "beats_per_bar": 3,
+            "switch_cost": 0.02,
+        })
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(
+            [s["job_id"] for s in r.json()["segments"]], [id2]
+        )
+
+    def test_comp_plan_uncovered_bar_422_with_bar_number(self):
+        # 小节1（拍 3..5）两轨都漏第 4 拍（索引 3）
+        id1 = self._create_comp_take_with_miss(
+            3, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        )
+        id2 = self._create_comp_take_with_miss(
+            3, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        )
+        r = self.client.post("/takes/comp-plan", json={
+            "job_ids": [id1, id2],
+            "beats_per_bar": 3,
+            "switch_cost": 0.0,
+        })
+        self.assertEqual(r.status_code, 422)
+        self.assertIn("2", r.json()["detail"])
+        self.assertIn("小节", r.json()["detail"])
+
+    def test_comp_plan_partial_match_bar_unavailable(self):
+        # 轨1 漏小节0 的拍、轨2 漏小节1 的拍：每小节仍有完整轨 -> 各取一节
+        id1 = self._create_comp_take_with_miss(
+            3, [0.01] * 6
+        )
+        id2 = self._create_comp_take_with_miss(
+            0, [0.02] * 6
+        )
+        r = self.client.post("/takes/comp-plan", json={
+            "job_ids": [id1, id2],
+            "beats_per_bar": 3,
+            "switch_cost": 0.0,
+        })
+        self.assertEqual(r.status_code, 200, r.text)
+        data = r.json()
+        self.assertEqual(
+            [s["job_id"] for s in data["segments"]], [id1, id2]
+        )
+        self.assertEqual(data["switch_count"], 1)
+
+    def test_comp_plan_validation_errors(self):
+        id1 = self._create_comp_take([0.01] * 6)
+        id2 = self._create_comp_take([0.02] * 6)
+
+        # 重复 ID -> 400
+        r = self.client.post("/takes/comp-plan", json={
+            "job_ids": [id1, id1], "beats_per_bar": 3, "switch_cost": 0.0,
+        })
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("重复", r.json()["detail"])
+
+        # 少于 2 个 ID -> 422（Pydantic min_length）
+        r = self.client.post("/takes/comp-plan", json={
+            "job_ids": [id1], "beats_per_bar": 3, "switch_cost": 0.0,
+        })
+        self.assertEqual(r.status_code, 422)
+
+        # beats_per_bar 非法 / switch_cost 为负 -> 422
+        r = self.client.post("/takes/comp-plan", json={
+            "job_ids": [id1, id2], "beats_per_bar": 0, "switch_cost": 0.0,
+        })
+        self.assertEqual(r.status_code, 422)
+        r = self.client.post("/takes/comp-plan", json={
+            "job_ids": [id1, id2], "beats_per_bar": 3, "switch_cost": -0.01,
+        })
+        self.assertEqual(r.status_code, 422)
+
+        # 任务不存在 -> 404
+        r = self.client.post("/takes/comp-plan", json={
+            "job_ids": [id1, 999999], "beats_per_bar": 3, "switch_cost": 0.0,
+        })
+        self.assertEqual(r.status_code, 404)
+
+        # 任务未对齐 -> 409
+        pending = self.client.post("/jobs", json={
+            "reference_beats": self.COMP_REF,
+            "performance_onsets": self.COMP_REF,
+        }).json()["id"]
+        r = self.client.post("/takes/comp-plan", json={
+            "job_ids": [id1, pending],
+            "beats_per_bar": 3,
+            "switch_cost": 0.0,
+        })
+        self.assertEqual(r.status_code, 409)
+
+        # 上次对齐失败 -> 400
+        from app import crud, database
+        conn = database.connect()
+        try:
+            crud.save_error(conn, pending, "boom")
+        finally:
+            conn.close()
+        r = self.client.post("/takes/comp-plan", json={
+            "job_ids": [id1, pending],
+            "beats_per_bar": 3,
+            "switch_cost": 0.0,
+        })
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("boom", r.json()["detail"])
+
+    def test_comp_plan_grid_mismatch_422(self):
+        id1 = self._create_comp_take([0.01] * 6)
+        other = self._create_done_job({
+            "reference_beats": [0.0, 0.6, 1.2, 1.8, 2.4, 3.0],
+            "performance_onsets": [0.0, 0.6, 1.2, 1.8, 2.4, 3.0],
+        })
+        r = self.client.post("/takes/comp-plan", json={
+            "job_ids": [id1, other],
+            "beats_per_bar": 3,
+            "switch_cost": 0.0,
+        })
+        self.assertEqual(r.status_code, 422)
+        self.assertIn("参考节拍网格", r.json()["detail"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -25,6 +25,12 @@
 录音延迟，再按参考拍取各轨校正时间的中位数为合奏基准，列出偏离基准超过秒级
 阈值的任务；覆盖不足 3 轨的拍标记为不可判定，漏拍逐轨列出。
 
+至少 2 条共享同一参考网格的**已对齐录音**还能生成**剪辑方案（compilation
+plan）**：按参考拍划小节，只有完整匹配某小节全部拍的录音才可用于该小节，
+以该小节匹配拍平均绝对偏差为选用代价；用动态规划最小化各小节选用代价与
+相邻小节换轨代价之和，同代价时优先请求顺序靠前的任务，返回合并连续同源
+小节后的剪辑片段。
+
 ## 目录结构
 
 ```
@@ -35,12 +41,13 @@
 │   ├── tempo.py         # 节奏曲线（tempo map）估计：中位数窗口 + 稳定区间压缩
 │   ├── review.py        # 复核片段提取：漏拍/插入音/超阈值偏差按参考拍聚合
 │   ├── ensemble.py      # 跨任务合奏一致性：逐轨延迟校正 + 逐拍中位数基准
+│   ├── comp_plan.py     # 剪辑方案：按小节平均绝对偏差 + 换轨代价的动态规划拼轨
 │   ├── schemas.py       # Pydantic 请求/响应模型
 │   ├── database.py      # SQLite 连接、建表与旧库迁移
 │   └── crud.py          # 任务读写
 ├── tests/               # unittest 测试（对齐算法 18 个 + 节奏曲线 10 个
 │                        #   + 复核片段 14 个 + 合奏一致性 10 个
-│                        #   + 接口 30 个）
+│                        #   + 剪辑方案 13 个 + 接口 38 个）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
@@ -61,6 +68,9 @@ docker compose up --build
 - 合奏一致性接口示例：
   `POST http://localhost:8000/ensembles/consensus`
   （请求体 `{"job_ids": [1, 2, 3], "deviation_threshold": 0.05}`）
+- 剪辑方案接口示例：
+  `POST http://localhost:8000/takes/comp-plan`
+  （请求体 `{"job_ids": [1, 2], "beats_per_bar": 4, "switch_cost": 0.05}`）
 - SQLite 数据文件：容器内 `/data/alignment.db`，由命名卷 `beat-data` 持久化
 
 配置（均通过环境变量，见 `docker-compose.yml`）：
@@ -106,6 +116,7 @@ PYTHONPATH=. python -m unittest discover -s tests -v
 | GET    | `/jobs/{id}/tempo-map`     | 从 matched_beats 导出节奏曲线（tempo events） |
 | GET    | `/jobs/{id}/review-segments` | 提取复核片段：漏拍/插入音/超阈值偏差按参考拍聚合（拍号范围 + 摘要） |
 | POST   | `/ensembles/consensus`     | 跨任务合奏一致性：逐轨固定延迟校正后按参考拍取中位数基准，列出超阈值异常任务 |
+| POST   | `/takes/comp-plan`         | 多轨剪辑方案：按小节平均绝对偏差 + 换轨代价动态规划拼轨，合并连续同源小节 |
 | GET    | `/jobs`                    | 任务列表（摘要，按创建时间倒序）       |
 | GET    | `/health`                  | 健康检查                               |
 
@@ -189,7 +200,12 @@ curl -s -X POST http://localhost:8000/ensembles/consensus \
   -H 'Content-Type: application/json' \
   -d '{"job_ids": [1, 2, 3], "deviation_threshold": 0.05}'
 
-# 7) 列出全部任务
+# 7) 多轨剪辑方案（至少 2 个共享同一参考网格的已完成任务）
+curl -s -X POST http://localhost:8000/takes/comp-plan \
+  -H 'Content-Type: application/json' \
+  -d '{"job_ids": [1, 2], "beats_per_bar": 3, "switch_cost": 0.05}'
+
+# 8) 列出全部任务
 curl -s http://localhost:8000/jobs
 ```
 
@@ -503,6 +519,139 @@ curl -s -X POST http://localhost:8000/ensembles/consensus \
   -d '{"job_ids": [1, 2, 3, 4], "deviation_threshold": 0.05}'
 ```
 
+## 多轨剪辑方案（`POST /takes/comp-plan`）
+
+提交**至少 2 个已完成**任务 ID（每个任务对应一条已对齐录音）、**每小节拍数**
+与非负的**换轨代价**，在共享**完全相同的参考节拍网格**上按小节自动拼轨，
+生成剪辑方案。该接口按需计算、只读，不修改任何任务的对齐结果，也不落库。
+
+请求体：
+
+```json
+{
+  "job_ids": [1, 2],
+  "beats_per_bar": 4,
+  "switch_cost": 0.05
+}
+```
+
+- `job_ids`：已完成（`status=done`）任务 ID 列表，**至少 2 个**、**不可重复**；
+  各任务的 `reference_beats` 必须**逐值完全相同**（长度与每个时间点都相等），
+  任务顺序即请求顺序，用于同代价时的取舍。
+- `beats_per_bar`：每小节拍数（正整数）。参考拍自索引 0 起每该数划分为一个
+  小节；**末尾不足一小节的尾部拍仍作为一个（不完整）小节**参与选择。
+- `switch_cost`：相邻小节选用**不同**任务（换轨）的代价（≥ 0）。它与按秒计
+  的小节平均绝对偏差代价直接相加权衡：取 0 表示允许每小节自由换轨；值越大
+  越倾向于全程使用同一录音。
+
+处理流程：
+
+1. **划小节**：按 `beats_per_bar` 把共享参考拍切成连续小节（末尾小节可能
+   不足一拍组）。
+2. **小节可用性与选用代价**：某条录音只有**完整匹配该小节全部拍**时才可用于
+   该小节——小节内任一拍是漏拍（含插入拍导致的错位）即不可用；可用录音对
+   该小节的选用代价为小节各匹配拍 **|偏差| 的平均值**（平均绝对偏差，秒）。
+3. **动态规划**：以「各小节选用代价之和 + 相邻小节换轨代价之和」最小为目标
+   做逐小节 DP（时间复杂度 O(小节数 × 轨数²)）。在所有总代价最小的方案中，
+   取按**请求顺序**字典序最小的选轨序列：前向 DP 求出到达每个「小节 × 任务」
+   状态的最优代价，再从首小节起贪心，每小节取请求顺序最靠前、且已选前缀仍
+   能达成全局最优总代价的任务。
+4. **合并片段**：把选出的连续**同源小节**（相邻小节选用同一任务）合并为一个
+   片段返回；任一小节没有任何录音完整匹配其全部拍时，返回 `422` 并在
+   `detail` 中列出全部相关**小节序号（1 基）**。
+
+响应示例（2 条录音、每小节 3 拍、共 2 小节，零换轨代价各取所长）：
+
+```json
+{
+  "parameters": {"beats_per_bar": 3, "switch_cost": 0.0},
+  "job_ids": [1, 2],
+  "reference_beats": [0.0, 0.5, 1.0, 1.5, 2.0, 2.5],
+  "reference_beat_count": 6,
+  "beats_per_bar": 3,
+  "bar_count": 2,
+  "take_count": 2,
+  "switch_count": 1,
+  "total_cost": 0.02,
+  "segment_count": 2,
+  "segments": [
+    {
+      "segment_index": 0,
+      "job_id": 1,
+      "name": "take-a",
+      "bar_start": 1,
+      "bar_end": 1,
+      "bar_count": 1,
+      "ref_start_index": 0,
+      "ref_end_index": 2,
+      "beat_number_start": 1,
+      "beat_number_end": 3,
+      "beat_count": 3,
+      "ref_start_time": 0.0,
+      "ref_end_time": 1.0,
+      "source_start_time": 0.01,
+      "source_end_time": 1.01,
+      "source_start_perf_index": 0,
+      "source_end_perf_index": 2,
+      "mean_absolute_deviation": 0.01,
+      "selection_cost": 0.01
+    },
+    {
+      "segment_index": 1,
+      "job_id": 2,
+      "name": "take-b",
+      "bar_start": 2,
+      "bar_end": 2,
+      "bar_count": 1,
+      "ref_start_index": 3,
+      "ref_end_index": 5,
+      "beat_number_start": 4,
+      "beat_number_end": 6,
+      "beat_count": 3,
+      "ref_start_time": 1.5,
+      "ref_end_time": 2.5,
+      "source_start_time": 1.51,
+      "source_end_time": 2.51,
+      "source_start_perf_index": 3,
+      "source_end_perf_index": 5,
+      "mean_absolute_deviation": 0.01,
+      "selection_cost": 0.01
+    }
+  ]
+}
+```
+
+- 片段按**参考拍顺序**排列；连续同源小节已合并，`bar_count` / `beat_count`
+  为合并后的小节数与拍数，`bar_start` / `bar_end`、`beat_number_start` /
+  `beat_number_end` 为对应的 1 基小节序号 / 拍号范围（含端点），
+  `ref_start_index` / `ref_end_index` 为 0 基参考拍索引范围。
+- `source_start_time` / `source_end_time`：该片段**来源首末匹配音**的演奏
+  时间（秒），可直接用于在对应任务的录音上定位剪入 / 剪出点；
+  `source_start_perf_index` / `source_end_perf_index` 为其在该任务演奏序列
+  中的 0 基索引（漏拍会使索引与参考拍索引错位）。
+- `selection_cost` 为片段内各小节选用代价（平均绝对偏差）之和，
+  `mean_absolute_deviation` 为这些小节选用代价的小节平均值；顶层
+  `total_cost = 全部片段 selection_cost 之和 + switch_count × switch_cost`。
+- `switch_count` 为最优方案中相邻小节的换轨次数（片段数与换轨次数不必相等，
+  因为同一任务可能在间隔若干小节后再次被选中）。
+
+错误：
+
+- `400` 任务 ID 重复，或引用了上次对齐失败（`error`）的任务；
+- `404` 任一任务 ID 不存在；
+- `409` 引用了尚未对齐（`pending`）或无对齐结果（`result` 缺失）的任务；
+- `422` 任务数少于 2、`beats_per_bar` 非正、`switch_cost` 为负、任务之间
+  参考节拍网格不完全相同，或某小节没有任何录音完整匹配其全部拍
+  （`detail` 含 1 基小节序号，如“第 2、4 小节”）。
+
+调用示例：
+
+```bash
+curl -s -X POST http://localhost:8000/takes/comp-plan \
+  -H 'Content-Type: application/json' \
+  -d '{"job_ids": [1, 2], "beats_per_bar": 4, "switch_cost": 0.05}'
+```
+
 ## 算法说明
 
 设参考拍 `r₀..rₙ₋₁`、演奏音 `p₀..pₘ₋₁`，代价矩阵单元
@@ -556,3 +705,7 @@ D(i,j) = min of  ⎨ D(i−1,j)   + skip_penalty          漏拍（水平）
 - 合奏一致性（`POST /ensembles/consensus`）：任务 ID 重复或引用上次对齐
   失败的任务返回 `400`；任务不存在 `404`；任务尚未对齐或无对齐结果
   返回 `409`；成功为 `200`
+- 剪辑方案（`POST /takes/comp-plan`）：任务 ID 重复或引用上次对齐失败的
+  任务返回 `400`；任务不存在 `404`；任务尚未对齐或无对齐结果返回 `409`；
+  任务数不足 2、每小节拍数非正、换轨代价为负、参考节拍网格不一致，或某
+  小节无任何录音完整匹配其全部拍（含小节序号）返回 `422`；成功为 `200`
