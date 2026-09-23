@@ -318,6 +318,103 @@ class EnsembleBeat(BaseModel):
     )
 
 
+# ---- 多轨剪辑方案 POST /takes/comp-plan ----
+
+
+class CompPlanRequest(BaseModel):
+    job_ids: list[int] = Field(
+        ...,
+        min_length=2,
+        description=(
+            "参与剪辑方案的已完成任务 ID（每个任务对应一条录音 / take），"
+            "至少 2 个；不可重复，且所有任务的参考节拍网格必须完全相同"
+        ),
+    )
+    beats_per_measure: int = Field(
+        ..., ge=1, description="每小节拍数（按参考拍划小节，末尾不足整小节也作为一节）"
+    )
+    switch_cost: float = Field(
+        ..., ge=0, description="相邻小节选自不同任务（换轨）时的非负代价（秒）"
+    )
+
+
+class CompMeasureCandidate(BaseModel):
+    job_id: int = Field(..., description="候选录音对应的任务 ID")
+    mean_absolute_deviation: float = Field(
+        ..., description="该轨本小节匹配拍的平均绝对偏差（秒），即选用代价"
+    )
+
+
+class CompMeasure(BaseModel):
+    measure_index: int = Field(..., description="小节序号（0 基）")
+    measure_number: int = Field(..., description="小节序号（1 基）")
+    ref_start_index: int = Field(..., description="小节首拍的参考拍 0 基索引")
+    ref_end_index: int = Field(..., description="小节末拍的参考拍 0 基索引（含）")
+    beat_number_start: int = Field(..., description="小节首拍拍号（1 基）")
+    beat_number_end: int = Field(..., description="小节末拍拍号（1 基，含）")
+    beat_count: int
+    job_id: int = Field(..., description="本小节选中的录音任务 ID")
+    mean_absolute_deviation: float = Field(
+        ..., description="本小节选中录音的选用代价（匹配拍平均绝对偏差，秒）"
+    )
+    source_first_match_time: float = Field(
+        ..., description="选中录音在本小节首个匹配音的时间（秒，演奏时间轴）"
+    )
+    source_last_match_time: float = Field(
+        ..., description="选中录音在本小节末个匹配音的时间（秒，演奏时间轴）"
+    )
+    switched_from_previous: bool = Field(
+        ..., description="相对前一小节是否换轨（首小节恒为 false）"
+    )
+    candidates: list[CompMeasureCandidate] = Field(
+        ..., description="本小节全部候选录音（完整匹配该小节全部拍的轨，按请求顺序）"
+    )
+
+
+class CompSegment(BaseModel):
+    segment_index: int
+    job_id: int = Field(..., description="本片段来源录音的任务 ID")
+    name: str | None
+    measure_start_index: int = Field(..., description="片段首小节的 0 基序号")
+    measure_end_index: int = Field(..., description="片段末小节的 0 基序号（含）")
+    measure_number_start: int = Field(..., description="片段首小节序号（1 基）")
+    measure_number_end: int = Field(..., description="片段末小节序号（1 基，含）")
+    measure_count: int = Field(..., description="片段覆盖的小节数")
+    ref_start_index: int = Field(..., description="片段首拍的参考拍 0 基索引")
+    ref_end_index: int = Field(..., description="片段末拍的参考拍 0 基索引（含）")
+    beat_number_start: int = Field(..., description="片段首拍拍号（1 基）")
+    beat_number_end: int = Field(..., description="片段末拍拍号（1 基，含）")
+    beat_count: int = Field(..., description="片段覆盖的参考拍数")
+    source_start_time: float = Field(
+        ..., description="来源录音片段首个匹配音时间（秒，演奏时间轴）"
+    )
+    source_end_time: float = Field(
+        ..., description="来源录音片段末个匹配音时间（秒，演奏时间轴）"
+    )
+
+
+class CompPlanOut(BaseModel):
+    parameters: dict[str, Any]
+    job_ids: list[int] = Field(..., description="本次参与的任务 ID（按请求顺序）")
+    reference_beats: list[float] = Field(
+        ..., description="所有任务共享的参考节拍网格（秒）"
+    )
+    reference_beat_count: int
+    take_count: int = Field(..., description="参与的录音（任务）数量")
+    measure_count: int = Field(..., description="按参考拍划出的小节数（含末尾不足整小节）")
+    segment_count: int = Field(..., description="合并连续同源小节后的片段数量")
+    switch_count: int = Field(..., description="最优方案中的换轨次数")
+    total_cost: float = Field(
+        ..., description="最优方案总代价（各小节选用代价 + 换轨代价之和，秒）"
+    )
+    measures: list[CompMeasure] = Field(
+        ..., description="逐小节选轨明细（按小节顺序）"
+    )
+    segments: list[CompSegment] = Field(
+        ..., description="合并连续同源小节后的剪辑片段（按参考拍顺序）"
+    )
+
+
 class EnsembleConsensusOut(BaseModel):
     parameters: dict[str, Any]
     job_ids: list[int] = Field(..., description="本次参与的任务 ID（按提交顺序）")
